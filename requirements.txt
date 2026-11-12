@@ -1,1 +1,1 @@
-# The pat server uses only the Python standard library.
+psycopg[binary]==3.2.10

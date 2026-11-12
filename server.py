@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Serve the site and a shared pat counter.
 
-The count lives in data/pats.sqlite. Run this file instead of a static
-file host so every visitor adds to the same number.
+Production stores the count in Postgres (DATABASE_URL). One UPDATE ... RETURNING
+statement is the atomic increment, so every visitor shares the same total and
+restarts do not create a second counter. Local runs without DATABASE_URL use
+data/pats.sqlite.
 """
 
 import json
@@ -15,11 +17,19 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "pats.sqlite"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 MAX_PER_REQUEST = 30
 lock = threading.Lock()
 
 
 def init_db():
+    if DATABASE_URL:
+        init_postgres()
+    else:
+        init_sqlite()
+
+
+def init_sqlite():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with lock:
         conn = sqlite3.connect(DB_PATH)
@@ -38,7 +48,38 @@ def init_db():
             conn.close()
 
 
+def init_postgres():
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL, connect_timeout=15) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pats (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                count BIGINT NOT NULL
+            )
+            """
+        )
+        # Never replace a count that is already stored.
+        conn.execute(
+            "INSERT INTO pats (id, count) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
+        )
+        floor = os.environ.get("PAT_COUNT_FLOOR", "").strip()
+        if floor.isdigit():
+            conn.execute(
+                "UPDATE pats SET count = GREATEST(count, %s) WHERE id = 1",
+                (int(floor),),
+            )
+        conn.commit()
+
+
 def read_count():
+    if DATABASE_URL:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL, connect_timeout=15) as conn:
+            row = conn.execute("SELECT count FROM pats WHERE id = 1").fetchone()
+            return int(row[0] if row else 0)
     with lock:
         conn = sqlite3.connect(DB_PATH)
         try:
@@ -50,6 +91,18 @@ def read_count():
 
 def add_count(amount):
     amount = max(1, min(int(amount), MAX_PER_REQUEST))
+    if DATABASE_URL:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL, connect_timeout=15) as conn:
+            row = conn.execute(
+                "UPDATE pats SET count = count + %s WHERE id = 1 RETURNING count",
+                (amount,),
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                raise RuntimeError("pat counter row is missing")
+            return int(row[0])
     with lock:
         conn = sqlite3.connect(DB_PATH)
         try:
@@ -73,7 +126,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/pats":
-            self.respond({"count": read_count()})
+            try:
+                self.respond({"count": read_count()})
+            except Exception:
+                self.respond({"error": "counter unavailable"}, status=503)
             return
         if self.blocked(path):
             self.send_error(404)
@@ -95,14 +151,17 @@ class Handler(SimpleHTTPRequestHandler):
             except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
                 self.respond({"error": "bad request"}, status=400)
                 return
-        self.respond({"count": add_count(amount)})
+        try:
+            self.respond({"count": add_count(amount)})
+        except Exception:
+            self.respond({"error": "counter unavailable"}, status=503)
 
     def blocked(self, path):
         name = Path(path).name
         return (
             path.startswith("/data")
             or path.startswith("/api/")
-            or name in {"server.py", "Procfile"}
+            or name in {"server.py", "Procfile", "requirements.txt"}
         )
 
     def respond(self, payload, status=200):
